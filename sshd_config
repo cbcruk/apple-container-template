@@ -1,0 +1,6 @@
+HostKey /home/dev/.acx/hostkeys/ssh_host_ed25519_key
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers dev
+AcceptEnv LANG LC_*

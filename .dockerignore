@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!entrypoint.sh
+!sshd_config
+!skel
+!setup.d

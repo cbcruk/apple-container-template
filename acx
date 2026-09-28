@@ -1,0 +1,220 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${ACX_ENV_FILE:-$ROOT/acx.env}"
+
+load_env() {
+  local key value
+  [ -f "$ENV_FILE" ] || return 0
+  while IFS='=' read -r key value || [ -n "$key" ]; do
+    [[ "$key" =~ ^ACX_[A-Z0-9_]+$ ]] || continue
+    # Variables already set in the environment take precedence over the file.
+    [ -z "${!key+x}" ] || continue
+    value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    export "$key=$value"
+  done < "$ENV_FILE"
+}
+load_env
+
+NAME="${ACX_NAME:-acx-dev}"
+IMAGE="${ACX_IMAGE:-$NAME:latest}"
+VOLUME="${ACX_VOLUME:-${NAME%-dev}-home}"
+CPUS="${ACX_CPUS:-4}"
+MEMORY="${ACX_MEMORY:-8g}"
+VOLUME_SIZE="${ACX_VOLUME_SIZE:-64G}"
+TZ_NAME="${ACX_TZ:-UTC}"
+NODE_MAJOR="${ACX_NODE_MAJOR:-22}"
+
+SSH_KEY="$HOME/.ssh/${NAME}_ed25519"
+SSH_CONFIG="$HOME/.ssh/config"
+MARK_BEGIN="# >>> $NAME BEGIN >>>"
+MARK_END="# <<< $NAME END <<<"
+SNAP_PREFIX="${NAME%-dev}-snap-"
+
+log() { printf '\033[36m[%s]\033[0m %s\n' "$NAME" "$*" >&2; }
+die() { printf '\033[31m[%s]\033[0m %s\n' "$NAME" "$*" >&2; exit 1; }
+
+exists_container() { container inspect "$NAME" >/dev/null 2>&1; }
+exists_volume() { container volume inspect "$1" >/dev/null 2>&1; }
+exists_image() { container image inspect "$IMAGE" >/dev/null 2>&1; }
+is_running() { container ls --format json 2>/dev/null | grep -q "\"$NAME\""; }
+
+container_ip() {
+  # Only the container's own address carries a /prefix; the gateway does not.
+  container inspect "$NAME" 2>/dev/null \
+    | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' | head -1 | cut -d/ -f1
+}
+
+ensure_service() {
+  container system status >/dev/null 2>&1 || container system start --enable-kernel-install
+}
+
+ensure_key() {
+  [ -f "$SSH_KEY" ] && return
+  log "generating $SSH_KEY"
+  ssh-keygen -q -t ed25519 -N '' -C "$NAME" -f "$SSH_KEY"
+}
+
+build_image() {
+  log "building $IMAGE"
+  container build --tag "$IMAGE" --file "$ROOT/Dockerfile" \
+    --build-arg "TZ=$TZ_NAME" \
+    --build-arg "NODE_MAJOR=$NODE_MAJOR" \
+    "$ROOT"
+}
+
+update_ssh_config() {
+  local ip
+  ip="$(container_ip)"
+  [ -n "$ip" ] || die "could not resolve container IP"
+  touch "$SSH_CONFIG"
+  chmod 600 "$SSH_CONFIG"
+  local tmp
+  tmp="$(mktemp)"
+  awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+    $0==b { skip=1; next }
+    skip && $0==e { skip=0; after=1; next }
+    skip { next }
+    after && $0=="" { after=0; next }
+    { after=0; print }
+  ' "$SSH_CONFIG" > "$tmp"
+  {
+    printf '%s\n' "$MARK_BEGIN"
+    printf 'Host %s\n' "$NAME"
+    printf '  HostName %s\n' "$ip"
+    printf '  User dev\n'
+    printf '  IdentityFile %s\n' "$SSH_KEY"
+    printf '  IdentitiesOnly yes\n'
+    printf '  HostKeyAlias %s\n' "$NAME"
+    printf '%s\n\n' "$MARK_END"
+    cat "$tmp"
+  } > "$SSH_CONFIG"
+  rm -f "$tmp"
+  log "ssh config -> $NAME ($ip)"
+}
+
+create_container() {
+  container run -d --progress none --name "$NAME" \
+    --cpus "$CPUS" --memory "$MEMORY" \
+    -v "$VOLUME:/home/dev" \
+    -e "SSH_PUBKEY=$(cat "$SSH_KEY.pub")" \
+    "$IMAGE" >/dev/null
+}
+
+ensure_up() {
+  ensure_service
+  ensure_key
+  exists_image || build_image
+  exists_volume "$VOLUME" || container volume create -s "$VOLUME_SIZE" "$VOLUME" >/dev/null
+  if ! exists_container; then
+    log "creating container"
+    create_container
+  elif ! is_running; then
+    log "starting container"
+    container start "$NAME" >/dev/null
+  fi
+  update_ssh_config
+}
+
+copy_volume() {
+  local src="$1" dst="$2"
+  container run --rm --progress none -v "$src:/src" -v "$dst:/dst" --entrypoint /bin/bash "$IMAGE" -c \
+    'find /dst -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} + &&
+     tar -C /src --exclude=./lost+found -cf - . | tar -C /dst -xpf - && sync'
+}
+
+with_stopped() {
+  # A volume can attach to only one running container (VZErrorDomain Code=2).
+  local was_running=0
+  if is_running; then was_running=1; container stop "$NAME" >/dev/null; fi
+  "$@"
+  if [ "$was_running" = 1 ]; then container start "$NAME" >/dev/null; update_ssh_config; fi
+}
+
+cmd_snapshot() {
+  local snap="$SNAP_PREFIX${1:?snapshot name required}"
+  exists_volume "$snap" && die "$snap already exists"
+  exists_volume "$VOLUME" || die "$VOLUME does not exist"
+  container volume create -s "$VOLUME_SIZE" "$snap" >/dev/null
+  log "copying $VOLUME -> $snap"
+  with_stopped copy_volume "$VOLUME" "$snap"
+  log "snapshot $1 done"
+}
+
+cmd_restore() {
+  local snap="$SNAP_PREFIX${1:?snapshot name required}"
+  exists_volume "$snap" || die "$snap not found"
+  read -r -p "Overwrite $VOLUME with $snap? [y/N] " answer
+  [ "$answer" = y ] || [ "$answer" = Y ] || die "aborted"
+  cmd_snapshot "pre-restore-$(date +%Y%m%d-%H%M%S)"
+  log "copying $snap -> $VOLUME"
+  with_stopped copy_volume "$snap" "$VOLUME"
+  log "restore $1 done"
+}
+
+cmd_snapshots() {
+  container volume ls 2>/dev/null | awk -v p="$SNAP_PREFIX" 'NR==1 || index($1, p)==1'
+}
+
+cmd_status() {
+  if exists_container; then
+    container ls -a | awk -v n="$NAME" 'NR==1 || $1==n'
+  else
+    log "container not created"
+  fi
+  container volume ls | awk -v v="$VOLUME" 'NR==1 || $1==v'
+  is_running && log "ip $(container_ip)"
+  return 0
+}
+
+usage() {
+  cat <<EOF
+usage: acx <command>
+
+config: $ENV_FILE (override with ACX_ENV_FILE)
+
+  start                 build image/volume if missing, start container, update ssh config
+  stop                  stop container (home volume and rootfs kept)
+  status                container, volume and IP
+  ip                    print container IP
+  ssh                   ssh into the container
+  shell                 login shell via container exec
+  run '<cmd>'           run a command as dev
+  rebuild               rebuild image and recreate container (home kept)
+  destroy               remove container (home kept)
+  snapshot <name>       copy home volume to $SNAP_PREFIX<name>
+  restore <name>        overwrite home volume from snapshot
+  snapshots             list snapshots
+  snapshot-rm <name>    delete snapshot
+EOF
+}
+
+case "${1:-}" in
+  start) ensure_up ;;
+  stop) container stop "$NAME" >/dev/null && log "stopped" ;;
+  status) cmd_status ;;
+  ip) container_ip ;;
+  ssh) shift; ensure_up; exec ssh "$NAME" "$@" ;;
+  shell) ensure_up; exec container exec -it -u dev -w /home/dev "$NAME" zsh -l ;;
+  run) shift; is_running || ensure_up; exec container exec -u dev -w /home/dev "$NAME" zsh -lc "${*:?command required}" ;;
+  rebuild)
+    ensure_service
+    ensure_key
+    build_image
+    if exists_container; then container rm -f "$NAME" >/dev/null; fi
+    ensure_up
+    ;;
+  destroy)
+    exists_container || die "container not created"
+    container rm -f "$NAME" >/dev/null
+    log "container removed (volume $VOLUME kept)"
+    ;;
+  snapshot) shift; cmd_snapshot "$@" ;;
+  restore) shift; cmd_restore "$@" ;;
+  snapshots) cmd_snapshots ;;
+  snapshot-rm) shift; container volume rm "$SNAP_PREFIX${1:?snapshot name required}" ;;
+  -h|--help|help|"") usage ;;
+  *) usage; exit 1 ;;
+esac
